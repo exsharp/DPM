@@ -71,14 +71,18 @@ int main(int argc, char** argv)
 {
 	const char* keys =
 	{
-		"{@model_path    | | Path of the DPM cascade model}"
+		"{@model_path  | | Path of the DPM cascade model}"
+		"{@video_path  | | video Path}"
 	};
 
 	CommandLineParser parser(argc, argv, keys);
-	//string model_path(parser.get<string>(0));
-	string model_path = "D:\\Workspace\\DPM\\dpm-src\\samples\\data\\inriaperson.xml";
+	string model_path(parser.get<string>(0));
+	string video_path(parser.get<string>(1));
 
-	if (model_path.empty())
+	//model_path = "D:\\Workspace\\DPM\\dpm-src\\samples\\data\\inriaperson.xml";
+	//video_path = "D:\\Workspace\\DPM\\111.avi";
+
+	if (model_path.empty() || video_path.empty())
 	{
 		help();
 		return -1;
@@ -88,7 +92,9 @@ int main(int argc, char** argv)
 		DPMDetector::create(vector<string>(1, model_path));
 
 	// use web camera
-	VideoCapture capture("D:\\Workspace\\DPM\\111.avi");
+	//VideoCapture capture("D:\\Workspace\\DPM\\111.avi");
+	VideoCapture capture(video_path);
+
 	//capture.set(CV_CAP_PROP_FRAME_WIDTH, 320);
 	//capture.set(CV_CAP_PROP_FRAME_HEIGHT, 240);
 

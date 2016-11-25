@@ -41,13 +41,17 @@
 
 #include "dpm_cascade.hpp"
 #include "dpm_nms.hpp"
+#include "tbb/tbb.h"
 
 #include <limits>
 #include <fstream>
 #include <iostream>
 #include <stdio.h>
 
+#include "testharness.h"
+
 using namespace std;
+using namespace tbb;
 
 namespace cv
 {
@@ -92,10 +96,25 @@ void DPMCascade::initDPMCascade()
     dtValues.resize(tempStorageSize);
     pcaDtValues.resize(tempStorageSize);
 
-    fill(convValues.begin(), convValues.end(), -numeric_limits<double>::infinity());
-    fill(pcaConvValues.begin(), pcaConvValues.end(), -numeric_limits<double>::infinity());
-    fill(dtValues.begin(), dtValues.end(), -numeric_limits<double>::infinity());
-    fill(pcaDtValues.begin(), pcaDtValues.end(), -numeric_limits<double>::infinity());
+#define FILL
+#if (defined FILL && defined HAVE_TBB && defined TBB_LO)
+	vector<double> *params[4];
+	params[0] = &convValues;
+	params[1] = &pcaConvValues;
+	params[2] = &dtValues;
+	params[3] = &pcaDtValues;
+	int len = sizeof(params) / sizeof(vector<double>*);
+	parallel_for(blocked_range<size_t>(0, len), [&](blocked_range<size_t> &r){
+		for (size_t i = r.begin(); i < r.end();i++){
+			fill(params[i]->begin(), params[i]->end(), -numeric_limits<double>::infinity());
+		}
+	});
+#else
+	fill(convValues.begin(), convValues.end(), -numeric_limits<double>::infinity());
+	fill(pcaConvValues.begin(), pcaConvValues.end(), -numeric_limits<double>::infinity());
+	fill(dtValues.begin(), dtValues.end(), -numeric_limits<double>::infinity());
+	fill(pcaDtValues.begin(), pcaDtValues.end(), -numeric_limits<double>::infinity());
+#endif
 
     // each pyramid (convolution and distance transform) is stored
     // in a 1D array. Since pyramid levels have different sizes,
@@ -148,15 +167,21 @@ vector< vector<double> > DPMCascade::detect(Mat &image)
     if (image.depth() != CV_64F)
         image.convertTo(image, CV_64FC3);
 
+	Mark(computeFeatures);
     // compute features
     computeFeatures(image);
+	Mark(computeFeatures);
 
+	Mark(initDPMCascade);
     // pre-allocate storage
     initDPMCascade();
+	Mark(initDPMCascade);
 
     // cascade process
     vector< vector<double> > detections;
+	Mark(process);
     process(detections);
+	Mark(process);
 
     // non-maximum suppression
     NonMaximumSuppression nms;
@@ -176,11 +201,15 @@ void DPMCascade::computeFeatures(const Mat &im)
 
     feature = Feature(params);
 
+	Mark(feature.computeFeaturePyramid);
     // compute pyramid
     feature.computeFeaturePyramid(im, pyramid);
+	Mark(feature.computeFeaturePyramid);
 
+	Mark(feature.projectFeaturePyramid);
     // compute projected pyramid
     feature.projectFeaturePyramid(model.pcaCoeff, pyramid, pcaPyramid);
+	Mark(feature.projectFeaturePyramid);
 }
 
 void DPMCascade::computeLocationScores(vector< vector< double > >  &locationScores)
@@ -305,6 +334,152 @@ void DPMCascade::process( vector< vector<double> > &dets)
     vector< vector< Mat > > rootPCAScores;
     computeRootPCAScores(rootPCAScores);
 
+#define PROCESS
+#if (defined HAVE_TBB && defined TBB_LO && defined PROCESS)
+	concurrent_vector<vector<double>> _dets;
+	parallel_for(blocked_range<int>(0, model.numComponents), [&](blocked_range<int> &r){
+		for (int comp = r.begin(); comp < r.end(); comp++)
+		{
+			for (int plevel = 0; plevel < nlevels; plevel++)
+			{
+				// root filter pyramid level
+				int rlevel = plevel + interval;
+				double bias = model.bias[comp] + locationScores[comp][rlevel];
+				// get the scores of the first PCA filter
+				Mat rtscore = rootPCAScores[comp][rlevel];
+				// process each location in the current pyramid level
+				for (int rx = (int)ceil(padx/2.0); rx < rtscore.cols - (int)ceil(padx/2.0); rx++)
+				{
+					for (int ry = (int)ceil(pady/2.0); ry < rtscore.rows - (int)ceil(pady/2.0); ry++)
+					{
+						// get stage 0 score
+						double score = rtscore.at<double>(ry, rx) + bias;
+						// record PCA score
+						pcaScore[comp][0] = score - bias;
+						// cascade stage 1 through 2*numparts + 2
+						int stage = 1;
+						int numstages = 2*model.numParts[comp] + 2;
+						for(; stage < numstages; stage++)
+						{
+							double t = model.prunThreshold[comp][2*stage-1];
+							// check for hypothesis pruning
+							if (score < t)
+								break;
+
+							// pca == 1 if place filters
+							// pca == 0 if place non-pca filters
+							bool isPCA = (stage < model.numParts[comp] + 1 ? true : false);
+							// get the part index
+							// root parts have index -1, none-root part are indexed 0:numParts-1
+							int part = model.partOrder[comp][stage] - 1;// partOrder
+
+							if (part == -1)
+							{
+								// calculate the root non-pca score
+								// and replace the PCA score
+								double rscore = 0.0;
+								if (isPCA)
+								{
+									rscore = convolutionEngine.convolve(pcaPyramid[rlevel],
+										model.rootPCAFilters[comp],
+										model.pcaDim, rx, ry);
+									
+								}
+								else
+								{
+									rscore = convolutionEngine.convolve(pyramid[rlevel],
+										model.rootFilters[comp],
+										model.numFeatures, rx, ry);
+								}
+								score += rscore - pcaScore[comp][0];
+							}
+							else
+							{
+								// place a non-root filter
+								int pId = model.pFind[comp][part];
+								int px = 2*rx + (int)model.anchors[pId][0];
+								int py = 2*ry + (int)model.anchors[pId][1];
+
+								// look up the filter and deformation model
+								double defThreshold =
+									model.prunThreshold[comp][2*stage] - score;
+
+								double ps = computePartScore(plevel, pId, px, py,
+									isPCA, defThreshold);
+
+								if (isPCA)
+								{
+									// record PCA filter score
+									pcaScore[comp][part+1] = ps;
+									// update the hypothesis score
+									score += ps;
+								}
+								else
+								{
+									// update the hypothesis score by replacing
+									// the PCA score
+									score += ps - pcaScore[comp][part+1];
+								} // isPCA == false
+							} // part != -1
+
+						} // stages
+
+						// check if the hypothesis passed all stages with a
+						// final score over the global threshold
+						if (stage == numstages && score >= model.scoreThresh)
+						{
+							vector<double> coords;
+							// compute and record image coordinates of the detection window
+							double scale = model.sBin/scales[rlevel];
+							double x1 = (rx-padx)*scale;
+							double y1 = (ry-pady)*scale;
+							double x2 = x1 + model.rootFilterDims[comp].width*scale - 1;
+							double y2 = y1 + model.rootFilterDims[comp].height*scale - 1;
+
+							coords.push_back(x1);
+							coords.push_back(y1);
+							coords.push_back(x2);
+							coords.push_back(y2);
+
+							// compute and record image coordinates of the part filters
+							scale = model.sBin/scales[plevel];
+							int featWidth = pyramid[plevel].cols/feature.dimHOG;
+							for (int p = 0; p < model.numParts[comp]; p++)
+							{
+								int pId = model.pFind[comp][p];
+								int probx = 2*rx + (int)model.anchors[pId][0];
+								int proby = 2*ry + (int)model.anchors[pId][1];
+								int offset = dtLevelOffset[plevel] +
+									pId*featDimsProd[plevel] +
+									(proby - pady)*featWidth +
+									probx - padx;
+								int px = dtArgmaxX[offset] + padx;
+								int py = dtArgmaxY[offset] + pady;
+								x1 = (px - 2*padx)*scale;
+								y1 = (py - 2*pady)*scale;
+								x2 = x1 + model.partFilterDims[p].width*scale - 1;
+								y2 = y1 + model.partFilterDims[p].height*scale - 1;
+								coords.push_back(x1);
+								coords.push_back(y1);
+								coords.push_back(x2);
+								coords.push_back(y2);
+							}
+
+							// record component number and score
+							coords.push_back(comp + 1);
+							coords.push_back(score);
+
+							//dets.push_back(coords);
+							_dets.push_back(coords);
+						}
+					} // ry
+				} // rx
+			} // for each pyramid level
+		}
+	});
+	dets.assign(_dets.begin(), _dets.end());
+	return;
+#else
     // process each model component and pyramid level
     for (int comp = 0; comp < model.numComponents; comp++)
     {
@@ -442,6 +617,7 @@ void DPMCascade::process( vector< vector<double> > &dets)
             } // rx
         } // for each pyramid level
     } // for each component
+#endif
 }
 
 double DPMCascade::computePartScore(int plevel, int pId, int px, int py, bool isPCA, double defThreshold)
